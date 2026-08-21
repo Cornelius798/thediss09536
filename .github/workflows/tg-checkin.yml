@@ -2,13 +2,13 @@ name: TG Check-in
 
 on:
   schedule:
-    - cron: '0 4 * * *'   # 北京 12:00 触发
+    - cron: '0 4 * * *'   # 北京 12:00 触发（脚本内再随机延迟0~5小时）
   workflow_dispatch:
 
 jobs:
   checkin:
     runs-on: ubuntu-latest
-    timeout-minutes: 420   # 允许最长跑7小时（含随机延迟）
+    timeout-minutes: 350   # 留缓冲，低于 GitHub 的 6 小时硬限制
 
     steps:
       - uses: actions/checkout@v4
