@@ -2,17 +2,13 @@ name: TG Check-in
 
 on:
   schedule:
-    - cron: '0 4 * * *'    # 北京 12:00
-    - cron: '30 5 * * *'   # 北京 13:30
-    - cron: '0 7 * * *'    # 北京 15:00
-    - cron: '30 8 * * *'   # 北京 16:30
-    - cron: '0 10 * * *'   # 北京 18:00
+    - cron: '0 4 * * *'   # 北京 12:00 触发
   workflow_dispatch:
 
 jobs:
   checkin:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 420   # 允许最长跑7小时
 
     steps:
       - uses: actions/checkout@v4
@@ -27,6 +23,6 @@ jobs:
       - name: Run check-in
         env:
           TG_API_ID: ${{ secrets.TG_API_ID }}
-          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          TG_API_HASH: ${{ secrets.TG_API_ID }}
           TG_SESSION_B64: ${{ secrets.TG_SESSION_B64 }}
         run: python tg_checkin.py
