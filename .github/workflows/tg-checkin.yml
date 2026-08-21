@@ -8,7 +8,7 @@ on:
 jobs:
   checkin:
     runs-on: ubuntu-latest
-    timeout-minutes: 420   # 允许最长跑7小时
+    timeout-minutes: 420   # 允许最长跑7小时（含随机延迟）
 
     steps:
       - uses: actions/checkout@v4
@@ -23,6 +23,6 @@ jobs:
       - name: Run check-in
         env:
           TG_API_ID: ${{ secrets.TG_API_ID }}
-          TG_API_HASH: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
           TG_SESSION_B64: ${{ secrets.TG_SESSION_B64 }}
         run: python tg_checkin.py
