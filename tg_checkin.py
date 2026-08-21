@@ -19,8 +19,8 @@ BOT_USERNAME = 'lfreeai_bot'
 SESSION_B64 = os.getenv('TG_SESSION_B64', '')
 
 # ============ 随机延迟 ============
-# 基础延迟 0~90 分钟，模拟人工不固定时间签到
-DELAY_MINUTES = random.uniform(0, 90)
+# 0~360 分钟（0~6小时），签到时间落在 12:00~18:00 之间
+DELAY_MINUTES = random.uniform(0, 360)
 logging.info(f'⏳ 随机延迟 {DELAY_MINUTES:.1f} 分钟...')
 # =================================
 
@@ -74,7 +74,6 @@ async def checkin():
 
 
 async def main():
-    # 先随机等待
     await asyncio.sleep(DELAY_MINUTES * 60)
     success = await checkin()
     sys.exit(0 if success else 1)
