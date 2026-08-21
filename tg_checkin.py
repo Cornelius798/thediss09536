@@ -18,6 +18,15 @@ API_HASH = os.getenv('TG_API_HASH', '')
 BOT_USERNAME = 'lfreeai_bot'
 SESSION_B64 = os.getenv('TG_SESSION_B64', '')
 
+# ============ 概率签到 ============
+# 每天约 43% 概率执行签到，长期平均一周 3 天
+CHECKIN_PROBABILITY = 3 / 7
+
+if random.random() > CHECKIN_PROBABILITY:
+    logging.info('🎲 今天抽到休息日，跳过')
+    sys.exit(0)
+# ==================================
+
 # ============ 随机延迟 ============
 # 0~300 分钟（0~5小时），签到时间落在 12:00~17:00 之间
 # 上限不能超过 300，否则加上执行时间可能撞上 Actions 的 6 小时硬限制
