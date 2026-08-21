@@ -1,10 +1,3 @@
-#!/usr/bin/env python3
-"""
-@lfreeai_bot 自动签到（GitHub Actions 版）
-- 从环境变量恢复 session
-- 自动发送 /start 并点击签到按钮
-"""
-
 import asyncio
 import base64
 import logging
@@ -25,13 +18,18 @@ API_HASH = os.getenv('TG_API_HASH', '')
 BOT_USERNAME = 'lfreeai_bot'
 SESSION_B64 = os.getenv('TG_SESSION_B64', '')
 
+# ============ 随机延迟 ============
+# 基础延迟 0~90 分钟，模拟人工不固定时间签到
+DELAY_MINUTES = random.uniform(0, 90)
+logging.info(f'⏳ 随机延迟 {DELAY_MINUTES:.1f} 分钟...')
+# =================================
+
 
 async def checkin():
     if not API_ID or not API_HASH or not SESSION_B64:
         logging.error('❌ 缺少环境变量')
         return False
 
-    # 恢复 session 文件
     with open('tg_session.session', 'wb') as f:
         f.write(base64.b64decode(SESSION_B64))
 
@@ -61,7 +59,6 @@ async def checkin():
                             result_msgs = await client.get_messages(bot, limit=3)
                             for rm in result_msgs:
                                 if rm.message and ('签到' in rm.message or '余额' in rm.message):
-                                    # 不打印具体内容，避免泄露余额
                                     if '成功' in rm.message:
                                         logging.info('✅ 签到成功')
                                         return True
@@ -76,6 +73,12 @@ async def checkin():
     return False
 
 
-if __name__ == '__main__':
-    success = asyncio.run(checkin())
+async def main():
+    # 先随机等待
+    await asyncio.sleep(DELAY_MINUTES * 60)
+    success = await checkin()
     sys.exit(0 if success else 1)
+
+
+if __name__ == '__main__':
+    asyncio.run(main())
