@@ -19,8 +19,9 @@ BOT_USERNAME = 'lfreeai_bot'
 SESSION_B64 = os.getenv('TG_SESSION_B64', '')
 
 # ============ 随机延迟 ============
-# 0~360 分钟（0~6小时），签到时间落在 12:00~18:00 之间
-DELAY_MINUTES = random.uniform(0, 360)
+# 0~300 分钟（0~5小时），签到时间落在 12:00~17:00 之间
+# 上限不能超过 300，否则加上执行时间可能撞上 Actions 的 6 小时硬限制
+DELAY_MINUTES = random.uniform(0, 300)
 logging.info(f'⏳ 随机延迟 {DELAY_MINUTES:.1f} 分钟...')
 # =================================
 
