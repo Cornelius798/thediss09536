@@ -1,40 +1,52 @@
-name: Daily Check-in
+name: TabiToken Checkin
 
 on:
   schedule:
-    - cron: '30 20 * * *'
+    # UTC 04:00 = 北京时间 12:00（GitHub cron 常有几分钟到几十分钟延迟，属正常现象）
+    - cron: '0 4 * * *'
   workflow_dispatch:
+
+# 防止手动触发和定时触发撞在一起同时操作同一批账号
+concurrency:
+  group: tabitoken-checkin
+  cancel-in-progress: false
 
 jobs:
   checkin:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Install dependencies
+      - name: Install Playwright
         run: |
-          pip install -r requirements.txt
-          playwright install chromium
-          playwright install-deps chromium
+          python -m pip install --upgrade pip
+          pip install playwright==1.47.0
+          playwright install --with-deps chromium
+
+      - name: Random start delay
+        # 定时任务再随机推迟 0~15 分钟，避免每天固定分钟触发
+        if: github.event_name == 'schedule'
+        run: sleep $((RANDOM % 900))
 
       - name: Run check-in
         env:
-          TABI_TOKEN: ${{ secrets.TABI_TOKEN }}
-          TABI_USER_ID: ${{ secrets.TABI_USER_ID }}
+          TABI_ACCOUNTS: ${{ secrets.TABI_ACCOUNTS }}
           SITE_URL: https://tabitoken.com
           BACKUP_URL: https://tabitoken.cc
         run: python checkin.py
 
-      - name: Upload screenshots on failure
+      - name: Upload failure screenshots
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: debug-screenshots
-          path: '*.png'
-          retention-days: 3
+          name: screenshots-${{ github.run_id }}
+          path: 'fail_*.png'
+          if-no-files-found: ignore
+          retention-days: 7
