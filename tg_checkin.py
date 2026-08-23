@@ -24,7 +24,7 @@ TEST_MODE = os.getenv('TEST_MODE', '') == '1'
 
 if not TEST_MODE:
     # ============ 概率签到 ============
-    CHECKIN_PROBABILITY = 3 / 7
+    CHECKIN_PROBABILITY = 1
     if random.random() > CHECKIN_PROBABILITY:
         logging.info('🎲 今天抽到休息日，跳过')
         sys.exit(0)
