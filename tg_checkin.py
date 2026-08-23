@@ -19,12 +19,17 @@ API_HASH = os.getenv('TG_API_HASH', '')
 BOT_USERNAME = 'lfreeai_bot'
 SESSION_B64 = os.getenv('TG_SESSION_B64', '')
 
-# 测试模式：本地手动测试时设 TEST_MODE=1，跳过概率和延迟
-TEST_MODE = os.getenv('TEST_MODE', '') == '1'
+# 测试模式：本地设 TEST_MODE=1，或在 Actions 里手动触发（workflow_dispatch）
+TEST_MODE = (
+    os.getenv('TEST_MODE', '') == '1'
+    or os.getenv('GITHUB_EVENT_NAME', '') == 'workflow_dispatch'
+)
+
+DELAY_MINUTES = 0
 
 if not TEST_MODE:
     # ============ 概率签到 ============
-    CHECKIN_PROBABILITY = 1
+    CHECKIN_PROBABILITY = 3 / 7
     if random.random() > CHECKIN_PROBABILITY:
         logging.info('🎲 今天抽到休息日，跳过')
         sys.exit(0)
