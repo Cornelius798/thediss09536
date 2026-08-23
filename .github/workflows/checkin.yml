@@ -1,22 +1,40 @@
-name: tabi-checkin
+name: Daily Check-in
 
 on:
   schedule:
-    - cron: '5 0 * * *'      # UTC，即北京时间 08:05
+    - cron: '30 20 * * *'
   workflow_dispatch:
 
 jobs:
   checkin:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 10
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
-      - run: pip install playwright==1.48.0
-      - run: playwright install --with-deps chromium
-      - name: Run checkin
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          playwright install chromium
+          playwright install-deps chromium
+
+      - name: Run check-in
         env:
-          TABI_ACCOUNTS: ${{ secrets.TABI_ACCOUNTS }}
+          TABI_TOKEN: ${{ secrets.TABI_TOKEN }}
+          TABI_USER_ID: ${{ secrets.TABI_USER_ID }}
+          SITE_URL: https://tabitoken.com
+          BACKUP_URL: https://tabitoken.cc
         run: python checkin.py
+
+      - name: Upload screenshots on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-screenshots
+          path: '*.png'
+          retention-days: 3
