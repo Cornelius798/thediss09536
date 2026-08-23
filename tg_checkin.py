@@ -37,8 +37,8 @@ else:
 
 
 def solve_math(text: str):
-    """从消息里提取算术题并计算，支持 + - × ÷"""
-    m = re.search(r'(-?\d+)\s*([+\-×xX*÷/])\s*(-?\d+)\s*=', text)
+    """从消息里提取算术题并计算，支持 + - × ÷，等号可选"""
+    m = re.search(r'(-?\d+)\s*([+\-×xX*÷/])\s*(-?\d+)', text)
     if not m:
         return None
     a, op, b = int(m.group(1)), m.group(2), int(m.group(3))
@@ -115,10 +115,10 @@ async def main():
                 break
 
     if answer is None:
-        # 没有题目 —— 可能直接签到成功了（无答题模式）
+        # 没有题目 —— 可能直接签到成功（无答题模式）或今日已签
         for rm in quiz_msgs:
             if rm.message and ('成功' in rm.message or '已经' in rm.message):
-                logging.info('✅ 无需答题，直接完成')
+                logging.info('✅ 无需答题，流程完成')
                 sys.exit(0)
         logging.warning('⚠️ 未识别到算术题')
         sys.exit(1)
@@ -131,7 +131,6 @@ async def main():
         for row in quiz_msg.reply_markup.rows:
             for button in row.buttons:
                 btn_text = button.text.strip()
-                # 提取按钮里的数字（可能带 emoji 或其他符号）
                 nums = re.findall(r'-?\d+(?:\.\d+)?', btn_text)
                 if nums and nums[0] == answer:
                     logging.info(f'🖱️ 点击答案: {btn_text}')
