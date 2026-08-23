@@ -1,17 +1,12 @@
-#!/usr/bin/env python3
-"""
-tabitoken.com 自动签到（GitHub Actions 公开库版）
-- Playwright 无头浏览器
-- Token 注入认证
-- 日志不打印任何敏感信息
-"""
-
 import asyncio
+import base64
 import logging
 import os
+import random
+import re
 import sys
 
-from playwright.async_api import async_playwright, TimeoutError as PWTimeout
+from telethon import TelegramClient
 
 logging.basicConfig(
     level=logging.INFO,
@@ -19,130 +14,156 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)]
 )
 
-TOKEN = os.getenv('TABI_TOKEN', '')
-USER_ID = os.getenv('TABI_USER_ID', '')
-SITE_URL = os.getenv('SITE_URL', 'https://tabitoken.com')
-BACKUP_URL = os.getenv('BACKUP_URL', 'https://tabitoken.cc')
+API_ID = int(os.getenv('TG_API_ID', '0'))
+API_HASH = os.getenv('TG_API_HASH', '')
+BOT_USERNAME = 'lfreeai_bot'
+SESSION_B64 = os.getenv('TG_SESSION_B64', '')
+
+# 测试模式：本地设 TEST_MODE=1，或在 Actions 里手动触发（workflow_dispatch）
+TEST_MODE = (
+    os.getenv('TEST_MODE', '') == '1'
+    or os.getenv('GITHUB_EVENT_NAME', '') == 'workflow_dispatch'
+)
+
+DELAY_MINUTES = 0
+
+if not TEST_MODE:
+    # ============ 概率签到 ============
+    CHECKIN_PROBABILITY = 3 / 7
+    if random.random() > CHECKIN_PROBABILITY:
+        logging.info('🎲 今天抽到休息日，跳过')
+        sys.exit(0)
+
+    # ============ 随机延迟 ============
+    DELAY_MINUTES = random.uniform(0, 300)
+    logging.info(f'⏳ 随机延迟 {DELAY_MINUTES:.1f} 分钟...')
+else:
+    logging.info('🧪 测试模式：跳过概率与延迟')
 
 
-async def do_checkin(base_url: str) -> bool:
-    logging.info(f'🌐 尝试站点: {base_url}')
-
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=[
-                '--disable-blink-features=AutomationControlled',
-                '--no-sandbox',
-                '--disable-dev-shm-usage',
-            ]
-        )
-
-        context = await browser.new_context(
-            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            viewport={'width': 1280, 'height': 800},
-            locale='zh-CN',
-        )
-
-        async def add_auth(route, request):
-            headers = {**request.headers}
-            if '/api/' in request.url:
-                headers['authorization'] = f'Bearer {TOKEN}'
-                headers['new-api-user'] = USER_ID
-            await route.continue_(headers=headers)
-
-        await context.route('**/*', add_auth)
-        page = await context.new_page()
-
-        try:
-            await page.goto(base_url, wait_until='domcontentloaded', timeout=30000)
-            await page.wait_for_timeout(3000)
-            logging.info(f'✅ 页面加载完成')
-
-            # 查签到状态
-            status = await page.evaluate(f'''
-                async () => {{
-                    const resp = await fetch('/api/user/checkin?month=' + new Date().toISOString().slice(0,7), {{
-                        headers: {{
-                            'Authorization': 'Bearer {TOKEN}',
-                            'New-Api-User': '{USER_ID}'
-                        }}
-                    }});
-                    return await resp.json();
-                }}
-            ''')
-
-            if status.get('success'):
-                stats = status.get('data', {}).get('stats', {})
-                if stats.get('checked_in_today'):
-                    logging.info('✅ 今日已签到')
-                    return True
-
-            logging.info('🔘 未签到，尝试点击按钮...')
-
-            btn = page.locator('button:has-text("每日签到")').first
-            if await btn.count() == 0:
-                btn = page.locator('button:has-text("签到")').first
-
-            if await btn.count() == 0:
-                logging.error('❌ 未找到签到按钮')
-                await page.screenshot(path='no_button.png')
-                return False
-
-            if not await btn.is_enabled():
-                logging.info('⚪ 按钮已禁用')
-                return True
-
-            await btn.click()
-            logging.info('🖱️ 已点击签到按钮')
-
-            # 等待结果
-            for i in range(15):
-                await page.wait_for_timeout(2000)
-                result = await page.evaluate(f'''
-                    async () => {{
-                        const resp = await fetch('/api/user/checkin?month=' + new Date().toISOString().slice(0,7), {{
-                            headers: {{
-                                'Authorization': 'Bearer {TOKEN}',
-                                'New-Api-User': '{USER_ID}'
-                            }}
-                        }});
-                        return await resp.json();
-                    }}
-                ''')
-                if result.get('success') and result.get('data', {}).get('stats', {}).get('checked_in_today'):
-                    logging.info('✅ 签到成功！')
-                    return True
-
-            logging.error('⏰ 超时未确认签到成功')
-            await page.screenshot(path='timeout.png')
-            return False
-
-        except PWTimeout:
-            logging.error(f'⏰ 超时')
-            return False
-        except Exception as e:
-            logging.error(f'💥 异常: {type(e).__name__}')
-            return False
-        finally:
-            await browser.close()
+def solve_math(text: str):
+    """从消息里提取算术题并计算，支持 + - × ÷，等号可选"""
+    m = re.search(r'(-?\d+)\s*([+\-×xX*÷/])\s*(-?\d+)', text)
+    if not m:
+        return None
+    a, op, b = int(m.group(1)), m.group(2), int(m.group(3))
+    try:
+        if op == '+':
+            return str(a + b)
+        if op == '-':
+            return str(a - b)
+        if op in ('×', 'x', 'X', '*'):
+            return str(a * b)
+        if op in ('÷', '/'):
+            if b == 0:
+                return None
+            r = a / b
+            return str(int(r)) if r == int(r) else str(round(r, 2))
+    except Exception:
+        pass
+    return None
 
 
 async def main():
-    if not TOKEN or not USER_ID:
+    if not API_ID or not API_HASH or not SESSION_B64:
         logging.error('❌ 缺少环境变量')
-        return False
+        sys.exit(1)
 
-    for url in [SITE_URL, BACKUP_URL]:
-        ok = await do_checkin(url)
-        if ok:
-            return True
-        logging.info('❌ 该站失败，尝试下一个...')
+    if not TEST_MODE:
+        await asyncio.sleep(DELAY_MINUTES * 60)
 
-    logging.error('❌ 所有站点均失败')
-    return False
+    with open('tg_session.session', 'wb') as f:
+        f.write(base64.b64decode(SESSION_B64))
+
+    client = TelegramClient('tg_session', API_ID, API_HASH)
+    await client.start()
+    logging.info('✅ TG 登录成功')
+
+    bot = await client.get_entity(BOT_USERNAME)
+
+    # ===== 第一步：发送 /start，点签到按钮 =====
+    await client.send_message(bot, '/start')
+    logging.info('📤 已发送 /start')
+    await asyncio.sleep(random.uniform(3, 6))
+
+    msgs = await client.get_messages(bot, limit=5)
+    clicked = False
+    for msg in msgs:
+        if msg.reply_markup and hasattr(msg.reply_markup, 'rows'):
+            for row in msg.reply_markup.rows:
+                for button in row.buttons:
+                    if '签到' in button.text:
+                        logging.info(f'🖱️ 点击: {button.text}')
+                        await msg.click(data=button.data)
+                        clicked = True
+                        break
+                if clicked:
+                    break
+        if clicked:
+            break
+
+    if not clicked:
+        logging.warning('⚠️ 未找到签到按钮')
+        sys.exit(1)
+
+    # ===== 第二步：等题目出现，解析并点答案 =====
+    await asyncio.sleep(random.uniform(3, 6))
+
+    quiz_msgs = await client.get_messages(bot, limit=5)
+    answer = None
+    quiz_msg = None
+    for qm in quiz_msgs:
+        if qm.message and ('?' in qm.message or '？' in qm.message):
+            answer = solve_math(qm.message)
+            if answer is not None:
+                quiz_msg = qm
+                break
+
+    if answer is None:
+        # 没有题目 —— 可能直接签到成功（无答题模式）或今日已签
+        for rm in quiz_msgs:
+            if rm.message and ('成功' in rm.message or '已经' in rm.message):
+                logging.info('✅ 无需答题，流程完成')
+                sys.exit(0)
+        logging.warning('⚠️ 未识别到算术题')
+        sys.exit(1)
+
+    logging.info(f'🧮 计算答案: {answer}')
+
+    # 点正确答案按钮
+    answered = False
+    if quiz_msg.reply_markup and hasattr(quiz_msg.reply_markup, 'rows'):
+        for row in quiz_msg.reply_markup.rows:
+            for button in row.buttons:
+                btn_text = button.text.strip()
+                nums = re.findall(r'-?\d+(?:\.\d+)?', btn_text)
+                if nums and nums[0] == answer:
+                    logging.info(f'🖱️ 点击答案: {btn_text}')
+                    await quiz_msg.click(data=button.data)
+                    answered = True
+                    break
+            if answered:
+                break
+
+    if not answered:
+        logging.error('❌ 未找到正确答案按钮')
+        sys.exit(1)
+
+    # ===== 第三步：确认结果 =====
+    await asyncio.sleep(random.uniform(3, 6))
+    result_msgs = await client.get_messages(bot, limit=3)
+    for rm in result_msgs:
+        if rm.message:
+            if '成功' in rm.message:
+                logging.info('✅ 签到成功')
+                sys.exit(0)
+            elif '已经' in rm.message:
+                logging.info('✅ 今日已签到')
+                sys.exit(0)
+
+    logging.warning('⚠️ 未确认结果，但流程已走完')
+    sys.exit(0)
 
 
 if __name__ == '__main__':
-    success = asyncio.run(main())
-    sys.exit(0 if success else 1)
+    asyncio.run(main())
