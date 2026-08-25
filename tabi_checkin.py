@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-tabitoken.com 自动签到（Turnstile 硬校验站）
+tabitoken.com 自动签到（Turnstile 硬校验站，GitHub Actions 实验版）
 思路：UC Mode 真实浏览器在正确域名下渲染并通过 Turnstile，
 拿到 token 后用访问令牌提交签到。
 多账号：TABI_TOKEN_1 / TABI_TOKEN_2 ...
@@ -17,18 +17,18 @@ CHECKIN_PATH = "/api/user/checkin"
 STATUS_PATH = "/api/status"
 
 # 每个账号解验证码的最大尝试时间（秒）
-SOLVE_TIMEOUT = 60
+SOLVE_TIMEOUT = 120
 
 
 def collect_tokens():
     tokens = []
+    # 兼容单号
+    if os.environ.get("TABI_TOKEN", "").strip():
+        tokens.append(("主号", os.environ["TABI_TOKEN"].strip()))
     for i in range(1, 11):
         v = os.environ.get(f"TABI_TOKEN_{i}", "").strip()
         if v:
             tokens.append((f"号{i}", v))
-    # 兼容单号
-    if os.environ.get("TABI_TOKEN", "").strip():
-        tokens.insert(0, ("主号", os.environ["TABI_TOKEN"].strip()))
     return tokens
 
 
@@ -53,7 +53,6 @@ def inject_turnstile(sb, sitekey):
     js = f"""
     window.__tsToken = null;
     window.__tsErr = null;
-    // 清理旧容器
     let old = document.getElementById('__ts_box');
     if (old) old.remove();
     let box = document.createElement('div');
@@ -89,24 +88,38 @@ def inject_turnstile(sb, sitekey):
 
 
 def wait_token(sb, timeout=SOLVE_TIMEOUT):
-    """轮询等待 turnstile token；期间尝试自动点击验证框"""
+    """轮询等待 turnstile token；期间反复尝试点击，并诊断渲染状态"""
     start = time.time()
-    clicked = False
+    click_count = 0
+    diagnosed = False
     while time.time() - start < timeout:
         tok = sb.execute_script("return window.__tsToken;")
         if tok:
             return tok
+
         err = sb.execute_script("return window.__tsErr;")
         if err:
             print(f"[!] turnstile error-callback: {err}", flush=True)
-        # 尝试自动点击（UC Mode 的系统级点击）
-        if not clicked:
+
+        # 一次性诊断：组件渲染了吗？iframe 出来了吗？
+        if not diagnosed and time.time() - start > 6:
+            diag = sb.execute_script("""
+              const box = document.getElementById('__ts_box');
+              const ifr = box ? box.querySelectorAll('iframe').length : -1;
+              const hasTS = !!window.turnstile;
+              return JSON.stringify({box: !!box, iframes: ifr, turnstileLoaded: hasTS});
+            """)
+            print(f"[诊断] {diag}", flush=True)
+            diagnosed = True
+
+        # 反复尝试点击（每 ~10 秒一次，最多 5 次）
+        if click_count < 5 and int(time.time() - start) % 10 < 2:
             try:
                 sb.uc_gui_click_captcha()
-                clicked = True
-                print("[*] 已尝试点击验证框", flush=True)
+                click_count += 1
+                print(f"[*] 点击验证框 第{click_count}次", flush=True)
             except Exception as e:
-                print(f"[!] 自动点击失败(可忽略): {e}", flush=True)
+                print(f"[!] 点击失败(可忽略): {e}", flush=True)
         time.sleep(2)
     return None
 
@@ -165,6 +178,11 @@ def process_account(sb, label, token, sitekey):
     ts_token = wait_token(sb)
     if not ts_token:
         print("[!] 未能获取 turnstile token（验证未通过）", flush=True)
+        try:
+            sb.save_screenshot(f"fail_{label}.png")
+            print(f"[*] 已保存截图 fail_{label}.png", flush=True)
+        except Exception:
+            pass
         return False
 
     print(f"[*] 拿到 turnstile token（前12位 {ts_token[:12]}...），提交签到", flush=True)
