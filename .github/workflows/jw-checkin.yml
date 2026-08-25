@@ -20,5 +20,6 @@ jobs:
           python-version: '3.11'
       - name: Run checkin
         env:
-          JW_TOKEN: ${{ secrets.JW_TOKEN }}
+          JW_TOKEN_1: ${{ secrets.JW_TOKEN_1 }}
+          JW_TOKEN_2: ${{ secrets.JW_TOKEN_2 }}
         run: python jw_checkin.py
