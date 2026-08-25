@@ -3,7 +3,7 @@ name: TabiToken 签到 (Turnstile 实验)
 on:
   workflow_dispatch:
   schedule:
-    - cron: '30 0 * * *'   # 每天 UTC 00:30（北京 08:30），错开其他任务
+    - cron: '30 0 * * *'   # 每天 UTC 00:30（北京 08:30）
 
 concurrency:
   group: tabi-checkin
@@ -12,7 +12,7 @@ concurrency:
 jobs:
   checkin:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
 
@@ -34,3 +34,12 @@ jobs:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: xvfb-run --auto-servernum python tabi_checkin.py
+
+      - name: Upload failure screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tabi-screenshots
+          path: "*.png"
+          if-no-files-found: ignore
+          retention-days: 3
