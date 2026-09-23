@@ -18,7 +18,9 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install telethon
+        # 锁版本：Telethon 1.45.0 把内联按钮重构了（KeyboardButtonCallback -> KeyboardInlineButton），
+        # 不锁会装到新版。tg_checkin.py 已加兼容函数，这里锁住更保险。
+        run: pip install "telethon==1.44.0"
 
       - name: Run check-in
         env:
