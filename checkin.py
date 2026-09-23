@@ -41,6 +41,22 @@ else:
     logging.info('🧪 测试模式：跳过概率与延迟')
 
 
+def _btn_data(button):
+    """取内联按钮的回调数据，兼容 Telethon 新旧版本。
+
+    Telethon 1.44 及以前：button.data
+    Telethon 1.45 起：button.type.data（KeyboardInlineButton + InlineButtonTypeCallback）
+    """
+    data = getattr(button, 'data', None)
+    if data is None:
+        data = getattr(getattr(button, 'type', None), 'data', None)
+    if data is None:
+        raise RuntimeError(
+            f'取不到按钮回调数据（{type(button).__name__}, text={getattr(button, "text", None)!r}）'
+        )
+    return data
+
+
 def solve_math(text: str):
     """从消息里提取算术题并计算，支持 + - × ÷，等号可选"""
     m = re.search(r'(-?\d+)\s*([+\-×xX*÷/])\s*(-?\d+)', text)
@@ -94,7 +110,7 @@ async def main():
                 for button in row.buttons:
                     if '签到' in button.text:
                         logging.info(f'🖱️ 点击: {button.text}')
-                        await msg.click(data=button.data)
+                        await msg.click(data=_btn_data(button))
                         clicked = True
                         break
                 if clicked:
@@ -139,7 +155,7 @@ async def main():
                 nums = re.findall(r'-?\d+(?:\.\d+)?', btn_text)
                 if nums and nums[0] == answer:
                     logging.info(f'🖱️ 点击答案: {btn_text}')
-                    await quiz_msg.click(data=button.data)
+                    await quiz_msg.click(data=_btn_data(button))
                     answered = True
                     break
             if answered:
