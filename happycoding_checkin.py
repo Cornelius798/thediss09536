@@ -20,6 +20,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 CFG = os.path.join(HERE, "happycoding_checkin.json")
 CST = timezone(timedelta(hours=8))
 TIMEOUT = 20
+# New API 默认 1 美元 = 500000 quota；$ 估算仅供参考，站方若改过换算率会不准
+QUOTA_PER_UNIT = 500000
 
 # ===== 结果推送配置 =====
 TG_BOT_TOKEN = (os.environ.get("TG_BOT_TOKEN") or "").strip()
@@ -76,6 +78,29 @@ def api(path, tok, method="GET"):
             return e.code, raw
 
 
+def fmt_quota(q):
+    """把 quota 数值格式化成「原始数（约 $x.xx）」。"""
+    try:
+        q = float(q)
+    except Exception:
+        return str(q)
+    return "%s（约 $%.2f）" % (format(int(q), ","), q / QUOTA_PER_UNIT)
+
+
+def balance_line(tok):
+    """查当前余额，返回一行文本；查不到返回空串（不影响主流程）。"""
+    code, data = api("/api/user/self", tok, "GET")
+    if code != 200 or not isinstance(data, dict):
+        return ""
+    d = data.get("data") if isinstance(data.get("data"), dict) else data
+    if not isinstance(d, dict) or "quota" not in d:
+        return ""
+    line = "💰 余额: " + fmt_quota(d.get("quota"))
+    if "used_quota" in d:
+        line += "\n📊 已用: " + fmt_quota(d.get("used_quota"))
+    return line
+
+
 def main():
     tok = token()
     if not tok:
@@ -105,7 +130,11 @@ def main():
     print(f"[{ts}] 状态: checked_in_today={already} {json.dumps(d, ensure_ascii=False)[:200] if d else ''}")
     if already:
         print(f"[{ts}] 今天已签到，跳过")
-        notify(f"✅ HappyCoding 今日已签到（跳过）\n[{ts}]")
+        bal = balance_line(tok)
+        msg = f"✅ HappyCoding 今日已签到（跳过）\n[{ts}]"
+        if bal:
+            msg += "\n" + bal
+        notify(msg)
         return 0
 
     code, data = api("/api/user/checkin", tok, "POST")
@@ -116,11 +145,19 @@ def main():
     already_msg = ("已签到" in msg) or ("已经签到" in msg)
     if code == 200 and ok:
         print(f"[{ts}] ✅ 签到成功 http=200 {detail}")
-        notify(f"✅ HappyCoding 签到成功\n{detail}\n[{ts}]")
+        bal = balance_line(tok)
+        m = f"✅ HappyCoding 签到成功\n{detail}\n[{ts}]"
+        if bal:
+            m += "\n" + bal
+        notify(m)
         return 0
     if code == 200 and already_msg:
         print(f"[{ts}] ✅ 今日已签到（POST 返回）{detail}")
-        notify(f"✅ HappyCoding 今日已签到\n[{ts}]")
+        bal = balance_line(tok)
+        m = f"✅ HappyCoding 今日已签到\n[{ts}]"
+        if bal:
+            m += "\n" + bal
+        notify(m)
         return 0
     print(f"[{ts}] ❌ 签到失败 http={code} {detail}")
     notify(f"❌ HappyCoding 签到失败 http={code}\n{detail}\n[{ts}]")
