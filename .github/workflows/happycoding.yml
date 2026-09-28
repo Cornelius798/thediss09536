@@ -3,7 +3,8 @@ name: HappyCoding Check-in
 on:
   schedule:
     # UTC 01:00 = 北京时间 09:00（GitHub cron 只有 UTC）
-    - cron: '0 1 * * *'
+    - cron: '5 16 * * *'     # 北京 00:05
+
   workflow_dispatch:      # 手动触发（Actions 页面 → Run workflow）
 
 permissions:
