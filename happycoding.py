@@ -1,224 +1,123 @@
-import asyncio
-import base64
-import json
-import logging
-import os
-import random
-import re
-import sys
-import urllib.request
-import urllib.parse
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""HappyCoding (New API) 每日自动签到 —— GitHub Actions 版（放在 thediss09536 仓库里跑）。
 
-from telethon import TelegramClient
+token 来源优先级：环境变量 HAPPYCODING_TOKEN（GitHub secret）> 同目录 happycoding_checkin.json。
+端点（New API 标准路由，已实测）：
+    GET  /api/user/checkin   查状态
+    POST /api/user/checkin   签到
+站点未开 Turnstile，纯 HTTP 即可。
+幂等：今天已签则跳过（不发 POST）。
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    handlers=[logging.StreamHandler(sys.stdout)]
-)
+结果推送（可选）：设了 TG_BOT_TOKEN + TG_CHAT_ID 就把结果推到自己的 tgbot；
+缺任意一个或推送失败都静默跳过，不影响签到本身。
+"""
+import json, os, sys, urllib.request, urllib.parse, urllib.error
+from datetime import datetime, timedelta, timezone
 
-API_ID = int(os.getenv('TG_API_ID', '0'))
-API_HASH = os.getenv('TG_API_HASH', '')
-BOT_USERNAME = 'lfreeai_bot'
-SESSION_B64 = os.getenv('TG_SESSION_B64', '')
+BASE = "https://happycoding.xyz"
+HERE = os.path.dirname(os.path.abspath(__file__))
+CFG = os.path.join(HERE, "happycoding_checkin.json")
+CST = timezone(timedelta(hours=8))
+TIMEOUT = 20
 
-# ===== 结果推送（尽力而为，缺变量或失败都不影响签到本身）=====
-NOTIFY_BOT_TOKEN = os.getenv('TG_BOT_TOKEN', '')
-NOTIFY_CHAT_ID = os.getenv('TG_CHAT_ID', '')
+# ===== 结果推送配置 =====
+TG_BOT_TOKEN = (os.environ.get("TG_BOT_TOKEN") or "").strip()
+TG_CHAT_ID = (os.environ.get("TG_CHAT_ID") or "").strip()
 
 
-def notify(text: str):
+def notify(text):
     """把签到结果推给自己的 tgbot。拿不到 token/chat 或失败都静默跳过。"""
-    if not NOTIFY_BOT_TOKEN or not NOTIFY_CHAT_ID:
+    if not TG_BOT_TOKEN or not TG_CHAT_ID:
         return
     try:
-        url = f'https://api.telegram.org/bot{NOTIFY_BOT_TOKEN}/sendMessage'
+        url = "https://api.telegram.org/bot%s/sendMessage" % TG_BOT_TOKEN
         data = urllib.parse.urlencode({
-            'chat_id': NOTIFY_CHAT_ID,
-            'text': text,
-            'disable_web_page_preview': 'true',
+            "chat_id": TG_CHAT_ID,
+            "text": text,
+            "disable_web_page_preview": "true",
         }).encode()
         req = urllib.request.Request(url, data=data)
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            body = resp.read().decode('utf-8', 'ignore')
-            ok = json.loads(body).get('ok', False)
-            if ok:
-                logging.info('📨 结果已推送到 tgbot')
-            else:
-                logging.warning(f'⚠️ 推送返回非 ok: {body[:200]}')
+        with urllib.request.urlopen(req, timeout=15) as r:
+            body = r.read().decode("utf-8", "ignore")
+            if not json.loads(body).get("ok", False):
+                print("推送返回非 ok: " + body[:200])
     except Exception as e:
-        logging.warning(f'⚠️ 推送失败（不影响签到）: {e}')
+        print("推送失败（不影响签到）: %s" % e)
 
 
-# 测试模式：本地设 TEST_MODE=1，或在 Actions 里手动触发（workflow_dispatch）
-TEST_MODE = (
-    os.getenv('TEST_MODE', '') == '1'
-    or os.getenv('GITHUB_EVENT_NAME', '') == 'workflow_dispatch'
-)
-
-DELAY_MINUTES = 0
-
-if not TEST_MODE:
-    # ============ 概率签到 ============
-    CHECKIN_PROBABILITY = 3 / 7
-    if random.random() > CHECKIN_PROBABILITY:
-        logging.info('🎲 今天抽到休息日，跳过')
-        sys.exit(0)
-
-    # ============ 随机延迟 ============
-    DELAY_MINUTES = random.uniform(0, 300)
-    logging.info(f'⏳ 随机延迟 {DELAY_MINUTES:.1f} 分钟...')
-else:
-    logging.info('🧪 测试模式：跳过概率与延迟')
-
-
-def _btn_data(button):
-    """取内联按钮的回调数据，兼容 Telethon 新旧版本。
-
-    Telethon 1.44 及以前：button.data
-    Telethon 1.45 起：button.type.data（KeyboardInlineButton + InlineButtonTypeCallback）
-    """
-    data = getattr(button, 'data', None)
-    if data is None:
-        data = getattr(getattr(button, 'type', None), 'data', None)
-    if data is None:
-        raise RuntimeError(
-            f'取不到按钮回调数据（{type(button).__name__}, text={getattr(button, "text", None)!r}）'
-        )
-    return data
-
-
-def solve_math(text: str):
-    """从消息里提取算术题并计算，支持 + - × ÷，等号可选"""
-    m = re.search(r'(-?\d+)\s*([+\-×xX*÷/])\s*(-?\d+)', text)
-    if not m:
-        return None
-    a, op, b = int(m.group(1)), m.group(2), int(m.group(3))
+def token():
+    t = (os.environ.get("HAPPYCODING_TOKEN") or "").strip()
+    if t:
+        return t
     try:
-        if op == '+':
-            return str(a + b)
-        if op == '-':
-            return str(a - b)
-        if op in ('×', 'x', 'X', '*'):
-            return str(a * b)
-        if op in ('÷', '/'):
-            if b == 0:
-                return None
-            r = a / b
-            return str(int(r)) if r == int(r) else str(round(r, 2))
+        return (json.load(open(CFG, encoding="utf-8")).get("access_token") or "").strip()
     except Exception:
-        pass
-    return None
+        return ""
 
 
-async def main():
-    if not API_ID or not API_HASH or not SESSION_B64:
-        logging.error('❌ 缺少环境变量')
-        notify('❌ TG 签到失败：缺少环境变量（API_ID/API_HASH/SESSION_B64）')
+def api(path, tok, method="GET"):
+    req = urllib.request.Request(BASE + path, method=method)
+    req.add_header("Authorization", "Bearer " + tok)
+    req.add_header("Accept", "application/json")
+    req.add_header("User-Agent", "Mozilla/5.0 (compatible; happycoding-checkin/1.0)")
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+            raw = r.read().decode("utf-8", "ignore")
+            try:
+                return r.status, json.loads(raw)
+            except Exception:
+                return r.status, raw
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", "ignore")
+        try:
+            return e.code, json.loads(raw)
+        except Exception:
+            return e.code, raw
+
+
+def main():
+    tok = token()
+    if not tok:
+        print("ERR: 没有 token（请在 repo 里配置 secret HAPPYCODING_TOKEN）")
+        notify("❌ HappyCoding 签到失败：没有 token（缺 secret HAPPYCODING_TOKEN）")
+        return 2
+    ts = datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S")
+
+    code, data = api("/api/user/checkin", tok, "GET")
+    if code == 401:
+        print(f"[{ts}] ERR: access token 无效/过期")
+        notify(f"❌ HappyCoding 签到失败：access token 无效/过期\n[{ts}]")
+        return 3
+    if code != 200:
+        print(f"[{ts}] ERR: 查状态 http={code} {str(data)[:200]}")
+        notify(f"❌ HappyCoding 签到失败：查状态 http={code}\n{str(data)[:200]}\n[{ts}]")
+        return 4
+
+    d = data.get("data") if isinstance(data, dict) else None
+    already = bool(d.get("checked_in_today")) if isinstance(d, dict) else False
+    print(f"[{ts}] 状态: checked_in_today={already} {json.dumps(d, ensure_ascii=False)[:200] if d else ''}")
+    if already:
+        print(f"[{ts}] 今天已签到，跳过")
+        notify(f"✅ HappyCoding 今日已签到（跳过）\n[{ts}]")
+        return 0
+
+    code, data = api("/api/user/checkin", tok, "POST")
+    ok = isinstance(data, dict) and (data.get("success") is True or data.get("code") in (0, "0"))
+    detail = json.dumps(data, ensure_ascii=False)[:300] if not isinstance(data, str) else data[:300]
+    if code == 200 and ok:
+        print(f"[{ts}] ✅ 签到成功 http=200 {detail}")
+        notify(f"✅ HappyCoding 签到成功\n{detail}\n[{ts}]")
+        return 0
+    print(f"[{ts}] ❌ 签到失败 http={code} {detail}")
+    notify(f"❌ HappyCoding 签到失败 http={code}\n{detail}\n[{ts}]")
+    return 5
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as e:
+        print(f"fatal: {e}")
+        notify(f"❌ HappyCoding 签到脚本异常：{e}")
         sys.exit(1)
-
-    if not TEST_MODE:
-        await asyncio.sleep(DELAY_MINUTES * 60)
-
-    with open('tg_session.session', 'wb') as f:
-        f.write(base64.b64decode(SESSION_B64))
-
-    client = TelegramClient('tg_session', API_ID, API_HASH)
-    await client.start()
-    logging.info('✅ TG 登录成功')
-
-    bot = await client.get_entity(BOT_USERNAME)
-
-    # ===== 第一步：发送 /start，点签到按钮 =====
-    await client.send_message(bot, '/start')
-    logging.info('📤 已发送 /start')
-    await asyncio.sleep(random.uniform(3, 6))
-
-    msgs = await client.get_messages(bot, limit=5)
-    clicked = False
-    for msg in msgs:
-        if msg.reply_markup and hasattr(msg.reply_markup, 'rows'):
-            for row in msg.reply_markup.rows:
-                for button in row.buttons:
-                    if '签到' in button.text:
-                        logging.info(f'🖱️ 点击: {button.text}')
-                        await msg.click(data=_btn_data(button))
-                        clicked = True
-                        break
-                if clicked:
-                    break
-        if clicked:
-            break
-
-    if not clicked:
-        logging.warning('⚠️ 未找到签到按钮')
-        notify('⚠️ TG 签到失败：未找到签到按钮')
-        sys.exit(1)
-
-    # ===== 第二步：等题目出现，解析并点答案 =====
-    await asyncio.sleep(random.uniform(3, 6))
-
-    quiz_msgs = await client.get_messages(bot, limit=5)
-    answer = None
-    quiz_msg = None
-    for qm in quiz_msgs:
-        if qm.message and ('?' in qm.message or '？' in qm.message):
-            answer = solve_math(qm.message)
-            if answer is not None:
-                quiz_msg = qm
-                break
-
-    if answer is None:
-        # 没有题目 —— 可能直接签到成功（无答题模式）或今日已签
-        for rm in quiz_msgs:
-            if rm.message and ('成功' in rm.message or '已经' in rm.message):
-                logging.info('✅ 无需答题，流程完成')
-                notify('✅ TG 签到完成（无需答题）')
-                sys.exit(0)
-        logging.warning('⚠️ 未识别到算术题')
-        notify('⚠️ TG 签到失败：未识别到算术题')
-        sys.exit(1)
-
-    logging.info(f'🧮 计算答案: {answer}')
-
-    # 点正确答案按钮
-    answered = False
-    if quiz_msg.reply_markup and hasattr(quiz_msg.reply_markup, 'rows'):
-        for row in quiz_msg.reply_markup.rows:
-            for button in row.buttons:
-                btn_text = button.text.strip()
-                nums = re.findall(r'-?\d+(?:\.\d+)?', btn_text)
-                if nums and nums[0] == answer:
-                    logging.info(f'🖱️ 点击答案: {btn_text}')
-                    await quiz_msg.click(data=_btn_data(button))
-                    answered = True
-                    break
-            if answered:
-                break
-
-    if not answered:
-        logging.error('❌ 未找到正确答案按钮')
-        notify(f'❌ TG 签到失败：算出答案 {answer} 但未找到对应按钮')
-        sys.exit(1)
-
-    # ===== 第三步：确认结果 =====
-    await asyncio.sleep(random.uniform(3, 6))
-    result_msgs = await client.get_messages(bot, limit=3)
-    for rm in result_msgs:
-        if rm.message:
-            if '成功' in rm.message:
-                logging.info('✅ 签到成功')
-                notify('✅ TG 签到成功')
-                sys.exit(0)
-            elif '已经' in rm.message:
-                logging.info('✅ 今日已签到')
-                notify('✅ TG 今日已签到')
-                sys.exit(0)
-
-    logging.warning('⚠️ 未确认结果，但流程已走完')
-    notify('⚠️ TG 签到：流程已走完但未确认结果')
-    sys.exit(0)
-
-
-if __name__ == '__main__':
-    asyncio.run(main())
