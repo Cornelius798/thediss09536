@@ -95,7 +95,13 @@ def main():
         return 4
 
     d = data.get("data") if isinstance(data, dict) else None
-    already = bool(d.get("checked_in_today")) if isinstance(d, dict) else False
+    # checked_in_today 嵌在 data.stats 里，兼容顶层写法
+    stats = d.get("stats") if isinstance(d, dict) else None
+    already = False
+    if isinstance(stats, dict) and "checked_in_today" in stats:
+        already = bool(stats.get("checked_in_today"))
+    elif isinstance(d, dict):
+        already = bool(d.get("checked_in_today"))
     print(f"[{ts}] 状态: checked_in_today={already} {json.dumps(d, ensure_ascii=False)[:200] if d else ''}")
     if already:
         print(f"[{ts}] 今天已签到，跳过")
@@ -103,11 +109,18 @@ def main():
         return 0
 
     code, data = api("/api/user/checkin", tok, "POST")
-    ok = isinstance(data, dict) and (data.get("success") is True or data.get("code") in (0, "0"))
     detail = json.dumps(data, ensure_ascii=False)[:300] if not isinstance(data, str) else data[:300]
+    ok = isinstance(data, dict) and (data.get("success") is True or data.get("code") in (0, "0"))
+    # 竞态/重复调用时接口回 success:false + "今日已签到"，视为已签成功
+    msg = data.get("message", "") if isinstance(data, dict) else str(data)
+    already_msg = ("已签到" in msg) or ("已经签到" in msg)
     if code == 200 and ok:
         print(f"[{ts}] ✅ 签到成功 http=200 {detail}")
         notify(f"✅ HappyCoding 签到成功\n{detail}\n[{ts}]")
+        return 0
+    if code == 200 and already_msg:
+        print(f"[{ts}] ✅ 今日已签到（POST 返回）{detail}")
+        notify(f"✅ HappyCoding 今日已签到\n[{ts}]")
         return 0
     print(f"[{ts}] ❌ 签到失败 http={code} {detail}")
     notify(f"❌ HappyCoding 签到失败 http={code}\n{detail}\n[{ts}]")
