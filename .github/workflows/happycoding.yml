@@ -1,4 +1,4 @@
-name: TG Check-in
+name: happycoding Check-in
 
 on:
   schedule:
