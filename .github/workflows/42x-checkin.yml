@@ -1,0 +1,47 @@
+name: 42x.shop Check-in
+
+on:
+  schedule:
+    # GitHub cron 只有 UTC。北京时间 09:00 = UTC 01:00；17:00 = UTC 09:00。
+    # 跑两次是**冗余**：scheduled workflow 在高负载时会被延迟甚至跳过，
+    # 而脚本是幂等的（先查状态，已签就退），多跑一次没有任何副作用。
+    - cron: '0 1 * * *'
+    - cron: '0 9 * * *'
+  workflow_dispatch:      # 手动触发（Actions 页面 → Run workflow）
+
+permissions:
+  contents: write         # 保活步骤要提交文件
+
+jobs:
+  checkin:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # 纯 stdlib，无需 pip install
+
+      - name: Run 42x.shop check-in
+        env:
+          X42_TOKEN: ${{ secrets.X42_TOKEN }}
+          # 结果推送用（可选）：缺任意一个则不推送，签到本身不受影响
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: python 42x_checkin.py
+
+      - name: Keepalive
+        # GitHub 会在仓库 60 天无活动后自动停用 scheduled workflow，
+        # 每次跑完提交一个时间戳文件保持活跃。
+        if: always()
+        run: |
+          mkdir -p .keepalive
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > .keepalive/42x_last_run.txt
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .keepalive/42x_last_run.txt
+          git diff --cached --quiet || { git commit -m "keepalive: 42x $(date -u +%F)"; git push; }
