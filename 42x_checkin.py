@@ -5,27 +5,35 @@
 站点事实（2026-10-03 实测）
 --------------------------
 - `GET /api/status` → `checkin_enabled=true`、`turnstile_check=false`、`system_name="42 API"`、
-  `version="v1.0.0-rc.15"`（响应头 `x-new-api-version` 一致）。
+  `version="v1.0.0-rc.15"`、`quota_per_unit=500000`。
 - New API 标准端点：
       GET  /api/user/checkin   查签到状态
       POST /api/user/checkin   执行签到
-- 站点**没开 Turnstile 人机验证**，纯 HTTP 即可，不需要浏览器自动化。
-- ★ 无效 token 的行为是 **HTTP 200 + `{"success":false,"message":"Unauthorized, invalid access
-  token"}`**，**不是 401** —— 必须按 body 判，否则会把"token 失效"误报成"签到失败"。
+- 站点没开 Turnstile，纯 HTTP 即可，不需要浏览器自动化。
+- ★★ 鉴权失败的两种形态**必须分清**（本地实测对照）：
+      · 请求里**完全不带** Authorization 头 → HTTP **401** `"Unauthorized, not logged in and
+        no access token provided"`  ← 说明**头在链路上丢了**（被代理/CF 剥掉、或 token 为空）
+      · 请求里带了 Authorization 但 token 不对 → HTTP **200** `"Unauthorized, invalid access
+        token"`                          ← 说明头到了、**token 值本身不对**
+  所以看到 401 不要去查 token 值，要查"头为什么没发出去"；看到 200+invalid 才是 token 错。
 
 token 来源优先级
 ----------------
 环境变量 `X42_TOKEN`（GitHub repo secret）> 同目录 `42x_checkin.json`。
-secret 在 repo → Settings → Secrets and variables → Actions → New repository secret 里建。
 
 幂等
 ----
-先 GET 状态，今天已签就直接退出（不发 POST），避免重复签到被站点判异常。
+先 GET 状态，今天已签就直接退出（不发 POST）。
 
 结果推送（可选）
 ----------------
 设了 `TG_BOT_TOKEN` + `TG_CHAT_ID` 就把结果推到自己的 tgbot；缺任意一个或推送失败都静默
 跳过，不影响签到本身。
+
+诊断
+----
+每次请求都打一行 `[diag]`（方法 / 状态码 / 最终 URL / 重定向次数 / 是否带上了 Authorization），
+失败时**原样打印服务器返回的 body**——出问题看 Actions 日志就能定位，不用猜。
 """
 import json
 import os
@@ -68,43 +76,78 @@ def notify(text):
         print("推送失败（不影响签到）: %s" % e)
 
 
+def mask(t):
+    """只暴露长度与前 4 位，够判断"secret 有没有传进来 / 有没有多余字符"，又不泄露全文。"""
+    if not t:
+        return "(空)"
+    return "len=%d prefix=%s…" % (len(t), t[:4])
+
+
 def token():
     t = (os.environ.get("X42_TOKEN") or "").strip()
-    if t:
-        return t
-    try:
-        return (json.load(open(CFG, encoding="utf-8")).get("access_token") or "").strip()
-    except Exception:
-        return ""
+    src = "env:X42_TOKEN"
+    if not t:
+        try:
+            t = (json.load(open(CFG, encoding="utf-8")).get("access_token") or "").strip()
+            src = "file:42x_checkin.json"
+        except Exception:
+            t = ""
+            src = "(无)"
+    return t, src
 
 
-def api(path, tok, method="GET"):
-    """调 New API 端点。返回 (http_status, 解析后的 json 或原文)。http=0 表示网络层失败。"""
-    req = urllib.request.Request(BASE + path, method=method)
-    req.add_header("Authorization", "Bearer " + tok)
+def api(path, tok, method="GET", auth="bearer", tag=""):
+    """调 New API 端点。返回 (http_status, 解析后的 json 或原文, diag 字符串)。
+
+    auth: "bearer" → Authorization: Bearer <tok>
+          "raw"    → Authorization: <tok>            （少数部署不吃 Bearer 前缀）
+          "none"   → 完全不带头                        （只为复现 401 做对照）
+    """
+    url = BASE + path
+    req = urllib.request.Request(url, method=method)
+    if auth == "bearer":
+        req.add_header("Authorization", "Bearer " + tok)
+    elif auth == "raw":
+        req.add_header("Authorization", tok)
     req.add_header("Accept", "application/json")
     req.add_header("User-Agent", "Mozilla/5.0 (compatible; 42x-checkin/1.0)")
+
+    sent = ("Bearer " + mask(tok)) if auth == "bearer" else (mask(tok) if auth == "raw" else "(未发送)")
+
+    def _diag(code, final_url):
+        return "[diag]%s %s %s -> http=%s final_url=%s auth=%s" % (
+            tag, method, path, code, final_url, sent)
+
     try:
         with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
             raw = r.read().decode("utf-8", "ignore")
+            d = _diag(r.status, r.url)
             try:
-                return r.status, json.loads(raw)
+                return r.status, json.loads(raw), d
             except Exception:
                 # Cloudflare 拦截/HTML 挑战页会走到这里 —— 原样带出去，日志里能看出是被墙了
-                return r.status, raw[:300]
+                return r.status, raw[:300], d
     except urllib.error.HTTPError as e:
         raw = e.read().decode("utf-8", "ignore")
+        d = _diag(e.code, getattr(e, "url", url))
         try:
-            return e.code, json.loads(raw)
+            return e.code, json.loads(raw), d
         except Exception:
-            return e.code, raw[:300]
+            return e.code, raw[:300], d
     except Exception as e:
-        return 0, "network error: %s" % e
+        return 0, "network error: %s" % e, _diag(0, url)
+
+
+def body_text(data):
+    if isinstance(data, str):
+        return data[:300]
+    try:
+        return json.dumps(data, ensure_ascii=False)[:300]
+    except Exception:
+        return str(data)[:300]
 
 
 def is_auth_error(code, data):
-    """42x.shop 实测：无效 token **不是 401**，而是 200 + success=false +
-    message='Unauthorized, invalid access token'（rc.15 行为）。这里统一识别。"""
     if code == 401:
         return True
     if isinstance(data, dict):
@@ -114,6 +157,18 @@ def is_auth_error(code, data):
         ):
             return True
     return False
+
+
+def header_missing_hint(code, data):
+    """401 + 'not logged in and no access token provided' ⇒ 服务器没收到 Authorization 头。"""
+    if code != 401:
+        return ""
+    msg = str(data.get("message") or "") if isinstance(data, dict) else str(data)
+    if "not logged in and no access token provided" in msg:
+        return ("\n   ↳ 服务器**没收到 Authorization 头**（不是 token 值错）。"
+                "\n     常见原因：① secret X42_TOKEN 为空/未生效；② 出口代理或 Cloudflare 把该头剥掉。"
+                "\n     下面自动做一次不带头的对照请求，确认站点行为一致。")
+    return ""
 
 
 def extract_checked_in_today(data):
@@ -136,7 +191,6 @@ def extract_checked_in_today(data):
 
 
 def fmt_quota(q):
-    """把 quota 数值格式化成「原始数（约 $x.xx）」。"""
     try:
         q = float(q)
     except Exception:
@@ -146,36 +200,49 @@ def fmt_quota(q):
 
 def balance_line(tok):
     """查当前余额，返回一行文本；查不到返回空串（不影响主流程）。"""
-    code, data = api("/api/user/self", tok, "GET")
+    code, data, d = api("/api/user/self", tok, "GET", tag=" [bal]")
+    print(d)
     if code != 200 or not isinstance(data, dict):
         return ""
-    d = data.get("data") if isinstance(data.get("data"), dict) else data
-    if not isinstance(d, dict) or "quota" not in d:
+    d2 = data.get("data") if isinstance(data.get("data"), dict) else data
+    if not isinstance(d2, dict) or "quota" not in d2:
         return ""
-    line = "💰 余额: " + fmt_quota(d.get("quota"))
-    if "used_quota" in d:
-        line += "\n📊 已用: " + fmt_quota(d.get("used_quota"))
+    line = "💰 余额: " + fmt_quota(d2.get("quota"))
+    if "used_quota" in d2:
+        line += "\n📊 已用: " + fmt_quota(d2.get("used_quota"))
     return line
 
 
 def main():
-    tok = token()
+    tok, src = token()
+    ts = datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S")
+    print("[%s] token 来源=%s %s" % (ts, src, mask(tok)))
+    print("[%s] X42_TOKEN 环境变量存在=%s" % (ts, "X42_TOKEN" in os.environ))
     if not tok:
         print("ERR: 没有 token（请在 repo 里配置 secret X42_TOKEN）")
         notify("❌ 42x.shop 签到失败：没有 token（缺 secret X42_TOKEN）")
         return 2
 
-    ts = datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S")
-
     # ① 查状态
-    code, data = api("/api/user/checkin", tok, "GET")
+    code, data, d = api("/api/user/checkin", tok, "GET")
+    print(d)
     if is_auth_error(code, data):
-        print("[%s] ERR: access token 无效/过期（http=%s）" % (ts, code))
-        notify("❌ 42x.shop 签到失败：access token 无效/过期\n[%s]" % ts)
+        print("[%s] ERR: 鉴权失败 http=%s body=%s" % (ts, code, body_text(data)))
+        print("[%s]%s" % (ts, header_missing_hint(code, data)))
+        # 自动对照：不带 Authorization 头发一次，看站点是不是回同样的 401
+        code0, data0, d0 = api("/api/user/checkin", "", "GET", auth="none", tag=" [对照]")
+        print(d0)
+        print("[%s]   不带头的对照结果: http=%s body=%s" % (ts, code0, body_text(data0)))
+        if code == 401 and code0 == 401:
+            print("[%s]   ⇒ 判定：**请求头在链路中丢失**（两者同为 401），不是 token 值的问题。"
+                  % ts)
+        elif code == 200:
+            print("[%s]   ⇒ 判定：**token 值不对**（头到了但站点不认）。" % ts)
+        notify("❌ 42x.shop 签到失败：鉴权失败 http=%s\n%s\n[%s]" % (code, body_text(data), ts))
         return 3
     if code != 200:
-        print("[%s] ERR: 查状态 http=%s %s" % (ts, code, str(data)[:200]))
-        notify("❌ 42x.shop 签到失败：查状态 http=%s\n%s\n[%s]" % (code, str(data)[:200], ts))
+        print("[%s] ERR: 查状态 http=%s %s" % (ts, code, body_text(data)))
+        notify("❌ 42x.shop 签到失败：查状态 http=%s\n%s\n[%s]" % (code, body_text(data), ts))
         return 4
 
     already = extract_checked_in_today(data)
@@ -201,8 +268,9 @@ def main():
         return 0
 
     # ② 执行签到
-    code, data = api("/api/user/checkin", tok, "POST")
-    detail = json.dumps(data, ensure_ascii=False)[:300] if not isinstance(data, str) else data[:300]
+    code, data, d = api("/api/user/checkin", tok, "POST")
+    print(d)
+    detail = body_text(data)
     ok = isinstance(data, dict) and (data.get("success") is True or data.get("code") in (0, "0"))
 
     # 竞态/重复调用时接口回 success:false + "今日已签到"，视为已签成功
