@@ -2,24 +2,34 @@
 # -*- coding: utf-8 -*-
 """42x.shop（New API v1.0.0-rc.15）每日自动签到 —— GitHub Actions 版。
 
-站点事实（2026-10-03 实测）
---------------------------
-- `GET /api/status` → `checkin_enabled=true`、`turnstile_check=false`、`system_name="42 API"`、
-  `version="v1.0.0-rc.15"`、`quota_per_unit=500000`。
-- New API 标准端点：
-      GET  /api/user/checkin   查签到状态
-      POST /api/user/checkin   执行签到
-- 站点没开 Turnstile，纯 HTTP 即可，不需要浏览器自动化。
-- ★★ 鉴权失败的两种形态**必须分清**（本地实测对照）：
-      · 请求里**完全不带** Authorization 头 → HTTP **401** `"Unauthorized, not logged in and
-        no access token provided"`  ← 说明**头在链路上丢了**（被代理/CF 剥掉、或 token 为空）
-      · 请求里带了 Authorization 但 token 不对 → HTTP **200** `"Unauthorized, invalid access
-        token"`                          ← 说明头到了、**token 值本身不对**
-  所以看到 401 不要去查 token 值，要查"头为什么没发出去"；看到 200+invalid 才是 token 错。
+★ 认证：需要**两个头**（New API 的防 token 泄露机制，缺一不可）
+--------------------------------------------------------------
+    1. Authorization: Bearer <access token>
+       ← 站点「个人设置 → 系统访问令牌」生成，环境变量 X42_TOKEN
+    2. New-Api-User: <数字用户 ID>
+       ← **必须是该 token 主人的数字 ID，严格相等**，环境变量 X42_USER_ID
+
+    权威依据：QuantumNous/new-api tag v1.0.0-rc.15，middleware/auth.go
+        apiUserIdStr := c.Request.Header.Get("New-Api-User")
+        if apiUserIdStr == ""            → 401 "New-Api-User header not provided"
+        apiUserId, err := strconv.Atoi(apiUserIdStr)
+        if err != nil                     → 401 "user id format error"（必须是纯数字）
+        if id != apiUserId                → 401 "user id mismatch"（必须严格等于 token 主人）
+    路由依据：router/api-router.go → selfRoute.Use(middleware.UserAuth())，
+        GET/POST /api/user/checkin 都在其下（POST 另挂 TurnstileCheck，但站点
+        turnstile_check=false，等于空操作）。
+
+★ 鉴权失败的四种形态（本地实测 + 源码对照，别搞混）
+---------------------------------------------------
+    · HTTP 401 "not logged in and no access token provided"  → **Authorization 头没送达**
+    · HTTP 401 "New-Api-User header not provided"             → 头到了、token 有效，**缺用户 ID**
+    · HTTP 200 "invalid access token"                         → Authorization 头到了，**token 值不对**
+    · HTTP 401 "user id mismatch"                             → 两个头都在，**用户 ID 填错了**
 
 token 来源优先级
 ----------------
-环境变量 `X42_TOKEN`（GitHub repo secret）> 同目录 `42x_checkin.json`。
+环境变量 `X42_TOKEN`（GitHub secret）> 同目录 `42x_checkin.json`。
+用户 ID 同理：`X42_USER_ID` > json 的 `user_id`。
 
 幂等
 ----
@@ -32,8 +42,8 @@ token 来源优先级
 
 诊断
 ----
-每次请求都打一行 `[diag]`（方法 / 状态码 / 最终 URL / 重定向次数 / 是否带上了 Authorization），
-失败时**原样打印服务器返回的 body**——出问题看 Actions 日志就能定位，不用猜。
+每次请求都打一行 `[diag]`（方法 / 状态码 / 最终 URL / 实际发出的 auth，只显示长度与前 4 位），
+失败时**原样打印服务器返回的 body** 并给出针对性结论。
 """
 import json
 import os
@@ -77,31 +87,39 @@ def notify(text):
 
 
 def mask(t):
-    """只暴露长度与前 4 位，够判断"secret 有没有传进来 / 有没有多余字符"，又不泄露全文。"""
+    """只暴露长度与前 4 位，够判断"值有没有传进来 / 有没有多余字符"，又不泄露全文。"""
     if not t:
         return "(空)"
     return "len=%d prefix=%s…" % (len(t), t[:4])
 
 
-def token():
-    t = (os.environ.get("X42_TOKEN") or "").strip()
-    src = "env:X42_TOKEN"
-    if not t:
+def load_creds():
+    """返回 (token, user_id, 来源说明)。env 优先于本地 json。"""
+    tok = (os.environ.get("X42_TOKEN") or "").strip()
+    uid = (os.environ.get("X42_USER_ID") or "").strip()
+    src = "env"
+    if not tok or not uid:
         try:
-            t = (json.load(open(CFG, encoding="utf-8")).get("access_token") or "").strip()
-            src = "file:42x_checkin.json"
+            cfg = json.load(open(CFG, encoding="utf-8"))
         except Exception:
-            t = ""
-            src = "(无)"
-    return t, src
+            cfg = {}
+        if not tok:
+            tok = str(cfg.get("access_token") or "").strip()
+            src = "file"
+        if not uid:
+            uid = str(cfg.get("user_id") or "").strip()
+            src = "file" if src == "file" else "env+file"
+    if not tok and not uid:
+        src = "(无)"
+    return tok, uid, src
 
 
-def api(path, tok, method="GET", auth="bearer", tag=""):
+def api(path, tok, uid, method="GET", auth="bearer", tag=""):
     """调 New API 端点。返回 (http_status, 解析后的 json 或原文, diag 字符串)。
 
-    auth: "bearer" → Authorization: Bearer <tok>
-          "raw"    → Authorization: <tok>            （少数部署不吃 Bearer 前缀）
-          "none"   → 完全不带头                        （只为复现 401 做对照）
+    auth: "bearer" → Authorization: Bearer <tok> + New-Api-User: <uid>
+          "raw"    → Authorization: <tok>      + New-Api-User: <uid>（少数部署不吃 Bearer 前缀）
+          "none"   → 不带头                      （只为复现 401 做对照）
     """
     url = BASE + path
     req = urllib.request.Request(url, method=method)
@@ -109,10 +127,16 @@ def api(path, tok, method="GET", auth="bearer", tag=""):
         req.add_header("Authorization", "Bearer " + tok)
     elif auth == "raw":
         req.add_header("Authorization", tok)
+    if auth in ("bearer", "raw") and uid:
+        req.add_header("New-Api-User", uid)
     req.add_header("Accept", "application/json")
     req.add_header("User-Agent", "Mozilla/5.0 (compatible; 42x-checkin/1.0)")
 
-    sent = ("Bearer " + mask(tok)) if auth == "bearer" else (mask(tok) if auth == "raw" else "(未发送)")
+    if auth == "none":
+        sent = "(未发送)"
+    else:
+        sent = "%s%s | New-Api-User:%s" % (
+            "Bearer " if auth == "bearer" else "", mask(tok), uid or "(空)")
 
     def _diag(code, final_url):
         return "[diag]%s %s %s -> http=%s final_url=%s auth=%s" % (
@@ -159,15 +183,24 @@ def is_auth_error(code, data):
     return False
 
 
-def header_missing_hint(code, data):
-    """401 + 'not logged in and no access token provided' ⇒ 服务器没收到 Authorization 头。"""
-    if code != 401:
-        return ""
+def auth_hint(code, data):
+    """把鉴权失败翻译成"下一步该改什么"，四种形态一一对应。"""
     msg = str(data.get("message") or "") if isinstance(data, dict) else str(data)
+    low = msg.lower()
     if "not logged in and no access token provided" in msg:
-        return ("\n   ↳ 服务器**没收到 Authorization 头**（不是 token 值错）。"
-                "\n     常见原因：① secret X42_TOKEN 为空/未生效；② 出口代理或 Cloudflare 把该头剥掉。"
-                "\n     下面自动做一次不带头的对照请求，确认站点行为一致。")
+        return ("   ↳ 判定：**Authorization 头没送达**（不是 token 值错）。"
+                "\n     查：secret X42_TOKEN 是否为空/未生效；出口代理或 Cloudflare 是否剥掉了该头。")
+    if "new-api-user header not provided" in low:
+        return ("   ↳ 判定：token 有效，但**缺 New-Api-User 头**。"
+                "\n     修：加 repo secret `X42_USER_ID` = 你的**数字用户 ID**（见 README 的取法）。")
+    if "user id format error" in low:
+        return ("   ↳ 判定：`X42_USER_ID` 不是纯数字。修：填数字 ID，别带引号/空格/用户名。")
+    if "user id mismatch" in low:
+        return ("   ↳ 判定：`X42_USER_ID` 填错了（必须严格等于 token 主人的 ID）。"
+                "\n     修：核对 repo secret `X42_USER_ID`。")
+    if "invalid access token" in low:
+        return ("   ↳ 判定：**token 值不对**（头到了但站点不认）。"
+                "\n     修：核对 secret `X42_TOKEN` 取自「个人设置 → 系统访问令牌」，不是 `sk-` 开头的 API 密钥。")
     return ""
 
 
@@ -198,9 +231,9 @@ def fmt_quota(q):
     return "%s（约 $%.2f）" % (format(int(q), ","), q / QUOTA_PER_UNIT)
 
 
-def balance_line(tok):
+def balance_line(tok, uid):
     """查当前余额，返回一行文本；查不到返回空串（不影响主流程）。"""
-    code, data, d = api("/api/user/self", tok, "GET", tag=" [bal]")
+    code, data, d = api("/api/user/self", tok, uid, "GET", tag=" [bal]")
     print(d)
     if code != 200 or not isinstance(data, dict):
         return ""
@@ -214,30 +247,35 @@ def balance_line(tok):
 
 
 def main():
-    tok, src = token()
+    tok, uid, src = load_creds()
     ts = datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S")
-    print("[%s] token 来源=%s %s" % (ts, src, mask(tok)))
-    print("[%s] X42_TOKEN 环境变量存在=%s" % (ts, "X42_TOKEN" in os.environ))
+    print("[%s] 凭证来源=%s token=%s user_id=%s" % (ts, src, mask(tok), uid or "(空)"))
+    print("[%s] 环境变量 X42_TOKEN=%s X42_USER_ID=%s" % (
+        ts, "X42_TOKEN" in os.environ, "X42_USER_ID" in os.environ))
+
     if not tok:
         print("ERR: 没有 token（请在 repo 里配置 secret X42_TOKEN）")
         notify("❌ 42x.shop 签到失败：没有 token（缺 secret X42_TOKEN）")
         return 2
+    if not uid:
+        print("ERR: 没有 user_id（New API 要求 New-Api-User 头，请在 repo 里配置 secret X42_USER_ID）")
+        notify("❌ 42x.shop 签到失败：缺 secret X42_USER_ID（数字用户 ID）\n[%s]" % ts)
+        return 2
 
     # ① 查状态
-    code, data, d = api("/api/user/checkin", tok, "GET")
+    code, data, d = api("/api/user/checkin", tok, uid, "GET")
     print(d)
     if is_auth_error(code, data):
         print("[%s] ERR: 鉴权失败 http=%s body=%s" % (ts, code, body_text(data)))
-        print("[%s]%s" % (ts, header_missing_hint(code, data)))
-        # 自动对照：不带 Authorization 头发一次，看站点是不是回同样的 401
-        code0, data0, d0 = api("/api/user/checkin", "", "GET", auth="none", tag=" [对照]")
+        hint = auth_hint(code, data)
+        if hint:
+            print("[%s]%s" % (ts, hint))
+        # 自动对照：不带 Authorization 头发一次，看站点是不是回"没带头"的 401
+        code0, data0, d0 = api("/api/user/checkin", "", "", "GET", auth="none", tag=" [对照]")
         print(d0)
         print("[%s]   不带头的对照结果: http=%s body=%s" % (ts, code0, body_text(data0)))
-        if code == 401 and code0 == 401:
-            print("[%s]   ⇒ 判定：**请求头在链路中丢失**（两者同为 401），不是 token 值的问题。"
-                  % ts)
-        elif code == 200:
-            print("[%s]   ⇒ 判定：**token 值不对**（头到了但站点不认）。" % ts)
+        if code == 401 and code0 == 401 and "not logged in" in body_text(data0):
+            print("[%s]   （对照也是 401「not logged in」⇒ 若本条与之一致，才是头没送达）" % ts)
         notify("❌ 42x.shop 签到失败：鉴权失败 http=%s\n%s\n[%s]" % (code, body_text(data), ts))
         return 3
     if code != 200:
@@ -258,7 +296,7 @@ def main():
     print("[%s] 状态: checked_in_today=%s %s" % (ts, already, detail))
     if already:
         print("[%s] 今天已签到，跳过" % ts)
-        bal = balance_line(tok)
+        bal = balance_line(tok, uid)
         if bal:
             print(bal)          # 也打到 Actions 日志里，不只在 TG 推送里
         msg = "✅ 42x.shop 今日已签到（跳过）\n[%s]" % ts
@@ -268,7 +306,7 @@ def main():
         return 0
 
     # ② 执行签到
-    code, data, d = api("/api/user/checkin", tok, "POST")
+    code, data, d = api("/api/user/checkin", tok, uid, "POST")
     print(d)
     detail = body_text(data)
     ok = isinstance(data, dict) and (data.get("success") is True or data.get("code") in (0, "0"))
@@ -280,7 +318,7 @@ def main():
     if code == 200 and (ok or already_msg):
         head = "✅ 42x.shop 签到成功" if ok else "✅ 42x.shop 今日已签到"
         print("[%s] %s http=200 %s" % (ts, head, detail))
-        bal = balance_line(tok)
+        bal = balance_line(tok, uid)
         if bal:
             print(bal)          # 也打到 Actions 日志里，不只在 TG 推送里
         m = "%s\n%s\n[%s]" % (head, detail, ts)
@@ -290,6 +328,9 @@ def main():
         return 0
 
     print("[%s] ❌ 签到失败 http=%s %s" % (ts, code, detail))
+    hint = auth_hint(code, data)
+    if hint:
+        print("[%s]%s" % (ts, hint))
     notify("❌ 42x.shop 签到失败 http=%s\n%s\n[%s]" % (code, detail, ts))
     return 5
 
