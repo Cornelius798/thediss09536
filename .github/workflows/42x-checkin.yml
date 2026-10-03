@@ -29,6 +29,8 @@ jobs:
       - name: Run 42x.shop check-in
         env:
           X42_TOKEN: ${{ secrets.X42_TOKEN }}
+          # ★ 必需：New API 要求 New-Api-User 头 = 你的数字用户 ID（防 token 泄露机制）
+          X42_USER_ID: ${{ secrets.X42_USER_ID }}
           # 结果推送用（可选）：缺任意一个则不推送，签到本身不受影响
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
