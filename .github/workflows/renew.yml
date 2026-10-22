@@ -1,0 +1,63 @@
+name: ASCS 免费 VPS 自动续期
+
+# 续期制说明：ASCS Cloud 免费套餐每 30 天要在面板里手动点一次 Renew 确认活跃，
+# 忘了续就回收。每周跑两次（周一、周四 UTC 02:17），给站点故障/登录抖动留重试空间；
+# 脚本内部还有 RENEW_WINDOW_DAYS 保护：距到期超过 10 天时只读状态、不乱点。
+on:
+  schedule:
+    - cron: "17 2 * * 1,4"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "干跑：只登录读状态并截图，不点击续期"
+        type: boolean
+        default: true
+      upload_screenshots:
+        description: "把截图作为 artifact 上传（注意：公开仓的 artifact 任何人可下载，默认关）"
+        type: boolean
+        default: false
+
+concurrency:
+  group: ascs-renew
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  renew:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 准备 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 安装 Playwright 与 Chromium
+        run: |
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: 运行续期脚本
+        env:
+          ASCS_EMAIL: ${{ secrets.ASCS_EMAIL }}
+          ASCS_PASSWORD: ${{ secrets.ASCS_PASSWORD }}
+          # 定时触发时按真实续期跑；手动触发时听 dry_run 输入（默认干跑）
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}
+          RENEW_WINDOW_DAYS: "10"
+        run: python scripts/renew.py
+
+      # 公开仓的 artifact 任何人都能下载，默认不上传；
+      # 排障时在手动触发里勾上 upload_screenshots 才会执行这一步。
+      - name: 上传排障截图（默认关）
+        if: ${{ always() && inputs.upload_screenshots }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ascs-renew-screenshots
+          path: screenshots/
+          retention-days: 14
+          if-no-files-found: ignore
