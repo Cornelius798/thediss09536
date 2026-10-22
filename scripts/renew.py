@@ -22,6 +22,10 @@ ASCS Cloud 免费 VPS 自动续期脚本（Playwright / Python）
 每一步都会在 screenshots/ 目录留截图，本地运行可看；GitHub Actions 侧
 默认不上传 artifact（公开仓人人可下载），如确需排障可在手动触发时
 把 upload_screenshots 设为 true 再上传。
+
+运行结束时在当前目录写 result.json（status / server / expiry_before /
+expiry_after / failed_step / note / dry_run），供工作流末尾的 Telegram
+通知步骤读取；路径可用环境变量 RESULT_FILE 覆盖。
 """
 import os
 import re
@@ -43,6 +47,37 @@ TRY_RENEW_WITHOUT_DATE = os.environ.get("TRY_RENEW_WITHOUT_DATE", "1") == "1"
 
 SHOT_DIR = Path(os.environ.get("SCREENSHOT_DIR", "screenshots"))
 SHOT_DIR.mkdir(parents=True, exist_ok=True)
+
+# 结构化结果摘要：运行结束时写 result.json，供工作流的 Telegram 通知步骤读取。
+# status: renewed（已续期）/ not_due（未到续期窗口或干跑）/ failed（失败，看 failed_step）
+RESULT_FILE = Path(os.environ.get("RESULT_FILE", "result.json"))
+RESULT = {
+    "status": "",
+    "server": "",
+    "expiry_before": "",
+    "expiry_after": "",
+    "failed_step": "",
+    "note": "",
+    "dry_run": DRY_RUN,
+}
+EXIT_STEP = {
+    2: "登录失败",
+    3: "没找到服务器",
+    4: "没找到续期入口",
+    5: "续期没生效",
+    6: "页面/网络错误",
+    7: "凭据环境变量缺失",
+}
+
+
+def write_result() -> None:
+    try:
+        RESULT_FILE.write_text(
+            json.dumps(RESULT, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        log(f"结果摘要已写入 {RESULT_FILE}")
+    except Exception as e:
+        log(f"写结果摘要失败: {type(e).__name__}")
 
 DATE_KEYS = re.compile(
     r"(renew|renewal|expir\w*|valid until|due|next billing|term ends|end date|到期|续期|有效期)",
@@ -421,10 +456,11 @@ def read_current_expiry(page, container=None):
     return None, frag, text
 
 
-def main() -> int:
+def run() -> int:
     email = os.environ.get("ASCS_EMAIL", "").strip()
     password = os.environ.get("ASCS_PASSWORD", "")
     if not email or not password:
+        RESULT["failed_step"] = "凭据环境变量缺失（ASCS_EMAIL / ASCS_PASSWORD 未配置）"
         log("缺少环境变量 ASCS_EMAIL / ASCS_PASSWORD（请在 GitHub Secrets 里配置）")
         return 7
     log(f"账号: {mask_email(email)} | DRY_RUN={DRY_RUN} | 续期窗口: 到期前 {RENEW_WINDOW_DAYS} 天")
@@ -432,6 +468,7 @@ def main() -> int:
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
+        RESULT["failed_step"] = "playwright 未安装"
         log("playwright 未安装")
         return 6
 
@@ -449,12 +486,14 @@ def main() -> int:
         try:
             # 1) 登录
             if not do_login(page, shot, email, password):
+                RESULT["failed_step"] = "登录失败（3 次重试后仍未进入仪表盘）"
                 log("失败阶段: 登录失败（3 次重试后仍未进入仪表盘）")
                 shot.take("fail-login")
                 return 2
 
             # 2) 服务器列表
             if not goto_servers(page, shot):
+                RESULT["failed_step"] = "打不开服务器列表页"
                 log("失败阶段: 打不开服务器列表页")
                 shot.take("fail-servers-page")
                 return 6
@@ -465,9 +504,15 @@ def main() -> int:
                 page.wait_for_timeout(4000)
                 container, card_text = find_server_container(page)
             if container is None:
+                RESULT["failed_step"] = f"没找到服务器（列表里没有包含 {SERVER_MATCH!r} 的条目）"
                 log(f"失败阶段: 没找到服务器（列表里没有包含 {SERVER_MATCH!r} 的条目）")
                 shot.take("fail-server-not-found")
                 return 3
+            RESULT["server"] = (
+                card_text.splitlines()[0].strip()[:120]
+                if card_text
+                else f"Micro Instances - i5 {SERVER_MATCH} Micro Free"
+            )
             log(f"找到服务器卡片: {card_text.splitlines()[0][:120] if card_text else '(无文本)'}")
 
             # 3) 进详情页（失败也不致命，可在卡片上找续期）
@@ -486,6 +531,7 @@ def main() -> int:
             expiry, frag, _ = read_current_expiry(page, detail_container or container)
             today = dt.datetime.now(dt.timezone.utc).date()
             if expiry:
+                RESULT["expiry_before"] = str(expiry)
                 days_left = (expiry - today).days
                 log(f"当前到期/续期日: {expiry} （剩余 {days_left} 天；依据: {frag!r}）")
             else:
@@ -499,6 +545,9 @@ def main() -> int:
             log(f"需要续期: {need_renew}")
 
             if not need_renew:
+                RESULT["status"] = "not_due"
+                if expiry:
+                    RESULT["note"] = f"距到期还有 {(expiry - today).days} 天，未进入续期窗口"
                 log("结论: 尚未进入续期窗口，本次不操作。")
                 shot.take("done-no-renew-needed")
                 return 0
@@ -513,12 +562,15 @@ def main() -> int:
                 page.wait_for_timeout(1000)
                 renew_loc, how = find_renew_button(page)
             if renew_loc is None:
+                RESULT["failed_step"] = "没找到续期入口（页面无 Renew 按钮/链接）"
                 log("失败阶段: 没找到续期入口（页面无 Renew 按钮/链接）")
                 shot.take("fail-no-renew-button")
                 return 4
             log(f"找到续期入口: {how}")
 
             if DRY_RUN:
+                RESULT["status"] = "not_due"
+                RESULT["note"] = "干跑：已定位续期入口，未点击"
                 log("DRY_RUN: 已定位续期入口，按要求不点击。")
                 shot.take("dry-run-renew-located")
                 return 0
@@ -544,19 +596,26 @@ def main() -> int:
             shot.take("after-renew-recheck")
             new_expiry, nfrag, _ = read_current_expiry(page, detail_container or container)
             if new_expiry:
+                RESULT["expiry_after"] = str(new_expiry)
                 log(f"回读到期/续期日: {new_expiry} （依据: {nfrag!r}）")
             if expiry and new_expiry and new_expiry > expiry:
+                RESULT["status"] = "renewed"
                 log(f"续期成功: {expiry} -> {new_expiry}")
                 return 0
             if success_signal and (expiry is None or new_expiry is None):
+                RESULT["status"] = "renewed"
+                RESULT["note"] = "页面出现成功字样，但日期无法回读比对"
                 log("续期大概率成功（页面出现成功字样，但日期无法回读比对）")
                 return 0
             if expiry is None and new_expiry is not None:
+                RESULT["status"] = "renewed"
                 log(f"续期完成（续前日期未知，续后到期日 {new_expiry}）")
                 return 0
+            RESULT["failed_step"] = "续期没生效（点击并走完确认流后，到期日未顺延）"
             log("失败阶段: 续期没生效（点击并走完确认流后，到期日未顺延）")
             return 5
         except Exception as e:
+            RESULT["failed_step"] = f"未知错误 {type(e).__name__}: {str(e)[:120]}"
             log(f"失败阶段: 未知错误 {type(e).__name__}: {str(e)[:200]}")
             try:
                 shot.take("fail-exception")
@@ -569,6 +628,22 @@ def main() -> int:
                 browser.close()
             except Exception:
                 pass
+
+
+def main() -> int:
+    """跑 run() 并保证 result.json 落盘（供 Telegram 通知步骤读取）。"""
+    code = 6
+    try:
+        code = run()
+    except Exception as e:  # run() 内部已分阶段兜底，这里只防万一
+        RESULT["failed_step"] = f"未捕获异常 {type(e).__name__}: {str(e)[:120]}"
+        code = 6
+    if not RESULT["status"]:
+        RESULT["status"] = "not_due" if code == 0 else "failed"
+    if RESULT["status"] == "failed" and not RESULT["failed_step"]:
+        RESULT["failed_step"] = EXIT_STEP.get(code, f"退出码 {code}")
+    write_result()
+    return code
 
 
 if __name__ == "__main__":

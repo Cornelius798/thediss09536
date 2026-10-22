@@ -61,3 +61,57 @@ jobs:
           path: screenshots/
           retention-days: 14
           if-no-files-found: ignore
+
+      # 无论续期成功/失败/未到窗口都发一条 Telegram 通知，
+      # 走仓库已有的 TG_BOT_TOKEN / TG_CHAT_ID 两个 Secret（其他签到工作流也在用）。
+      # 正文由 scripts/renew.py 写的 result.json 生成；不要 set -x、不要 echo secrets。
+      - name: Telegram 通知结果
+        if: always()
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 - <<'PYEOF' > tg_message.txt
+          import json, os
+          from pathlib import Path
+
+          data = {}
+          p = Path("result.json")
+          if p.exists():
+              try:
+                  data = json.loads(p.read_text(encoding="utf-8"))
+              except Exception:
+                  data = {}
+          status = data.get("status", "")
+          tag = "【演练】" if data.get("dry_run") else ""
+          lines = []
+          if status == "renewed":
+              lines.append(f"✅ ASCS 免费 VPS 续期成功{tag}")
+          elif status == "not_due":
+              lines.append(f"✅ ASCS 免费 VPS 续期：未到续期窗口{tag}")
+          else:
+              lines.append(f"❌ ASCS 免费 VPS 续期失败{tag}")
+          if data.get("server"):
+              lines.append(f"服务器：{data['server']}")
+          before, after = data.get("expiry_before", ""), data.get("expiry_after", "")
+          if before and after and after != before:
+              lines.append(f"到期日：{before} → {after}")
+          elif after or before:
+              lines.append(f"到期日：{after or before}")
+          if data.get("note"):
+              lines.append(data["note"])
+          if status not in ("renewed", "not_due"):
+              step = data.get("failed_step") or "续期脚本未产出结果（可能在写 result.json 前中断）"
+              lines.append(f"卡在：{step}")
+          run_url = os.environ.get("RUN_URL", "")
+          if run_url:
+              lines.append(f"运行记录：{run_url}")
+          print("\n".join(lines))
+          PYEOF
+          echo "----- Telegram 通知正文 -----"
+          cat tg_message.txt
+          curl -sS -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TG_CHAT_ID}" \
+            --data-urlencode "text@tg_message.txt" \
+            || echo "Telegram 通知发送失败（不改变本次运行结论）"

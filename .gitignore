@@ -2,3 +2,5 @@ screenshots/
 __pycache__/
 *.pyc
 .env
+result.json
+tg_message.txt

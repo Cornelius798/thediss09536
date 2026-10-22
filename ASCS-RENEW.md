@@ -11,21 +11,27 @@
   - `dry_run`：默认勾选，只登录读状态、截图，**不点续期**。第一次务必先干跑一遍确认能登录、能找到服务器。
   - `upload_screenshots`：默认不勾。公开仓的 artifact 任何人可下载，排障截图默认不上传；实在需要看图排障时再勾，保留 14 天。
 
-## 配置 Secrets（必须，只填两个）
+## 配置 Secrets（需要新增两个）
 
 在本仓库：**Settings → Secrets and variables → Actions → New repository secret**，添加：
 
-| 名称 | 值 |
-| --- | --- |
-| `ASCS_EMAIL` | ASCS Cloud 登录邮箱 |
-| `ASCS_PASSWORD` | ASCS Cloud 登录密码 |
+| 名称 | 值 | 状态 |
+| --- | --- | --- |
+| `ASCS_EMAIL` | ASCS Cloud 登录邮箱 | **需新增** |
+| `ASCS_PASSWORD` | ASCS Cloud 登录密码 | **需新增** |
+| `TG_BOT_TOKEN` | Telegram 机器人 token | 本仓库已有（其他签到工作流在用），**无需再填** |
+| `TG_CHAT_ID` | Telegram 通知目标 chat id | 本仓库已有，**无需再填** |
 
 > **安全说明**：Secrets 由 GitHub 加密存储，本仓库是公开仓也看不到、读不到，工作流日志里出现时会被自动打码。本仓库的代码与工作流文件本身不含任何凭据——脚本只从环境变量读 `ASCS_EMAIL` / `ASCS_PASSWORD`，且日志里邮箱只打码显示（如 `z***@live.com`）。请**不要**把密码写进代码、issue 或提交记录里。
+
+## 结果通知（Telegram）
+
+每次运行结束（成功、未到续期窗口、失败都发）工作流会往 Telegram 发一条摘要：✅/❌ + 状态（已续期 / 未到窗口 / 失败卡在哪一步）+ 到期日变化 + 本次运行链接；干跑（dry_run）会标注【演练】。摘要内容由脚本结束时写的 `result.json` 生成，通知走上面已有的 `TG_BOT_TOKEN` / `TG_CHAT_ID`。
 
 ## 脚本行为（scripts/renew.py）
 
 - 选择器策略：邮箱/密码框多选择器兜底；服务器按名字含 `3470` 模糊定位；Renew 按文本 `/renew/i` 在按钮/链接里找，并尝试 Manage/Details 进入详情页、Actions 菜单兜底。
-- 重试与日志：登录带 3 次重试；每一步打时间戳日志并在 `screenshots/` 留截图（本地运行时可直接看）。失败按阶段分开报：登录失败 / 没找到服务器 / 没找到续期入口 / 续期没生效，退出码分别为 2 / 3 / 4 / 5（0 = 成功，6 = 页面或网络错误，7 = 没配 Secrets）。
+- 重试与日志：登录带 3 次重试；每一步打时间戳日志并在 `screenshots/` 留截图（本地运行时可直接看）。失败按阶段分开报：登录失败 / 没找到服务器 / 没找到续期入口 / 续期没生效，退出码分别为 2 / 3 / 4 / 5（0 = 成功，6 = 页面或网络错误，7 = 没配 Secrets）。运行结束时另写一份 `result.json` 结构化摘要（状态 / 服务器 / 续期前后到期日 / 失败阶段），供工作流的 Telegram 通知步骤读取。
 - 环境变量：`DRY_RUN=1` 干跑；`RENEW_WINDOW_DAYS`（默认 10）距到期多少天内才续；`ASCS_SERVER_MATCH`（默认 `3470`）服务器名匹配串。
 
 ## 本地运行（可选）
