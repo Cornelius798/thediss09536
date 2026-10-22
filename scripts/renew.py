@@ -105,6 +105,38 @@ def log(msg: str) -> None:
     print(f"[{ts}Z] {msg}", flush=True)
 
 
+def mask_emails_in_text(text: str, known_email: str = "") -> str:
+    """把文本里出现的邮箱打码（已知账号整串替换 + 通用邮箱正则兜底）。"""
+    if not text:
+        return ""
+    out = text
+    if known_email and "@" in known_email:
+        out = out.replace(known_email, mask_email(known_email))
+
+    def _sub(m):
+        e = m.group(0)
+        name, _, domain = e.partition("@")
+        return (name[:1] or "?") + "***@" + domain
+
+    return re.sub(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+", _sub, out)
+
+
+def get_page_text(page, timeout=4000) -> str:
+    try:
+        return page.locator("body").inner_text(timeout=timeout) or ""
+    except Exception:
+        return ""
+
+
+def page_snapshot_note(page, email: str = "", limit: int = 2000) -> str:
+    """失败诊断用：页面可见全文，打码后截断到 limit 字符。"""
+    text = mask_emails_in_text(get_page_text(page), email)
+    text = text.strip()
+    if len(text) > limit:
+        text = text[:limit] + "…（已截断）"
+    return text
+
+
 def parse_date(text: str):
     """把各种日期字符串解析成 date，失败返回 None。"""
     if not text:
@@ -314,14 +346,14 @@ def goto_servers(page, shot) -> bool:
     return False
 
 
-def find_server_container(page):
+def find_server_container(page, timeout=6000):
     """
     定位目标服务器的卡片/行容器（包含 SERVER_MATCH 的最小可点击祖先）。
     返回 (container_locator, 卡片可见文本) 或 (None, 全文)。
     """
     txt_loc = page.locator(f"text=/{re.escape(SERVER_MATCH)}/").first
     try:
-        if not txt_loc.is_visible(timeout=6000):
+        if not txt_loc.is_visible(timeout=timeout):
             return None, ""
     except Exception:
         return None, ""
@@ -339,6 +371,40 @@ def find_server_container(page):
         return txt_loc, txt_loc.inner_text(timeout=1000)
     except Exception:
         return txt_loc, ""
+
+
+def wait_for_server(page, shot, email: str = "", timeout_s: int = 90, interval_s: int = 2):
+    """
+    轮询等待服务器列表异步渲染：页面全文出现 SERVER_MATCH 即算找到
+    （匹配放宽，不再只依赖卡片元素可见性），最长等 timeout_s 秒，
+    含等待 "Loading" 占位消失。期间若被重定向回登录页，按未登录处理。
+    返回 (outcome, container, card_text, last_text)：
+      outcome ∈ {"found", "not_found", "login"}
+    """
+    waited = 0
+    last_text = ""
+    while True:
+        if "login" in (page.url or ""):
+            log(f"等待服务器列表时被重定向到登录页（已等 {waited}s），按未登录处理")
+            return "login", None, "", last_text
+        last_text = get_page_text(page)
+        if SERVER_MATCH in last_text:
+            container, card_text = find_server_container(page, timeout=1500)
+            if container is not None:
+                return "found", container, card_text, last_text
+            # 全文已命中但卡片容器定位失败：仍算找到，
+            # 用命中文本所在元素当容器、命中行当卡片文本兜底。
+            log("页面全文已包含目标字样，但卡片容器定位失败，按全文命中兜底处理")
+            loc = page.locator(f"text=/{re.escape(SERVER_MATCH)}/").first
+            lines = [ln.strip() for ln in last_text.splitlines() if SERVER_MATCH in ln]
+            return "found", loc, (lines[0] if lines else ""), last_text
+        if waited == 0 or waited % 20 == 0:
+            loading = "（仍在 Loading）" if re.search(r"loading", last_text, re.I) else ""
+            log(f"等待服务器列表渲染… 已等 {waited}s / {timeout_s}s{loading}")
+        if waited >= timeout_s:
+            return "not_found", None, "", last_text
+        page.wait_for_timeout(interval_s * 1000)
+        waited += interval_s
 
 
 def open_server_detail(page, shot, container) -> bool:
@@ -382,8 +448,8 @@ def open_server_detail(page, shot, container) -> bool:
     return False
 
 
-def find_renew_button(page, container=None):
-    """在详情页（或卡片容器）里定位 Renew 按钮。返回 (点击函数, 描述)。"""
+def find_renew_button(page, container=None, timeout=1500):
+    """在详情页（或卡片容器）里定位 Renew 按钮。返回 (locator, 描述)。"""
     scopes = []
     if container is not None:
         scopes.append(container)
@@ -392,17 +458,45 @@ def find_renew_button(page, container=None):
         for role in ("button", "link"):
             try:
                 loc = scope.get_by_role(role, name=RENEW_TEXT).first
-                if loc.is_visible(timeout=1500):
+                if loc.is_visible(timeout=timeout):
                     return loc, f"{role}:renew"
             except Exception:
                 continue
         try:
             loc = scope.locator("button, a, [role=button]").filter(has_text=RENEW_TEXT).first
-            if loc.is_visible(timeout=1500):
+            if loc.is_visible(timeout=timeout):
                 return loc, "filter:renew"
         except Exception:
             continue
     return None, ""
+
+
+def wait_for_renew_button(page, container=None, timeout_s: int = 60, interval_s: int = 2):
+    """
+    轮询等待续期入口（按钮也可能异步渲染），最长等 timeout_s 秒。
+    中途（约 10 秒时）若仍没找到，尝试点一次 Actions/更多菜单再继续等——
+    续期入口有时藏在菜单里。返回 (locator, 描述)，找不到返回 (None, "")。
+    """
+    waited = 0
+    tried_menu = False
+    while True:
+        loc, how = find_renew_button(page, container, timeout=700)
+        if loc is not None:
+            return loc, how
+        if not tried_menu and waited >= 10:
+            tried_menu = True
+            clicked = click_by_text(
+                page, [re.compile(r"actions|more|manage", re.I)], timeout=1500
+            )
+            if clicked:
+                log(f"续期入口未出现，已尝试展开菜单: {clicked!r}")
+                page.wait_for_timeout(1000)
+        if waited >= timeout_s:
+            return None, ""
+        if waited == 0 or waited % 20 == 0:
+            log(f"等待续期入口渲染… 已等 {waited}s / {timeout_s}s")
+        page.wait_for_timeout(interval_s * 1000)
+        waited += interval_s
 
 
 def confirm_flow(page, shot) -> bool:
@@ -498,14 +592,22 @@ def run() -> int:
                 shot.take("fail-servers-page")
                 return 6
 
-            container, card_text = find_server_container(page)
-            if container is None:
-                # 列表异步加载时再等一轮
-                page.wait_for_timeout(4000)
-                container, card_text = find_server_container(page)
-            if container is None:
+            # 列表页是 SPA：卡片异步渲染（先显示 "Loading your servers..."），
+            # 轮询等待页面全文出现 SERVER_MATCH，最长 90 秒；中途被踢回登录页按未登录处理。
+            outcome, container, card_text, _last_text = wait_for_server(page, shot, email)
+            if outcome == "login":
+                RESULT["failed_step"] = "登录态失效（等待服务器列表时被重定向到登录页）"
+                RESULT["note"] = "页面快照: " + page_snapshot_note(page, email)
+                log("失败阶段: 登录态失效（等待服务器列表时被重定向到登录页）")
+                log("失败时页面全文: " + RESULT["note"])
+                shot.take("fail-session-expired")
+                return 2
+            if outcome != "found" or container is None:
                 RESULT["failed_step"] = f"没找到服务器（列表里没有包含 {SERVER_MATCH!r} 的条目）"
+                # 诊断：把当时页面全文（打码+截断）写进日志与 result.json 的 note
+                RESULT["note"] = "页面快照: " + page_snapshot_note(page, email)
                 log(f"失败阶段: 没找到服务器（列表里没有包含 {SERVER_MATCH!r} 的条目）")
+                log("失败时页面全文: " + RESULT["note"])
                 shot.take("fail-server-not-found")
                 return 3
             RESULT["server"] = (
@@ -552,18 +654,15 @@ def run() -> int:
                 shot.take("done-no-renew-needed")
                 return 0
 
-            # 5) 找续期入口
-            renew_loc, how = find_renew_button(page, detail_container or container)
+            # 5) 找续期入口（按钮可能异步渲染，轮询最长等 60 秒，含展开菜单尝试）
+            renew_loc, how = wait_for_renew_button(page, detail_container or container)
             if renew_loc is None and detail_container is None:
-                renew_loc, how = find_renew_button(page, container)
-            if renew_loc is None:
-                # 有时续期入口在 Actions / 更多菜单里
-                click_by_text(page, [re.compile(r"actions|more|manage", re.I)], timeout=2000)
-                page.wait_for_timeout(1000)
-                renew_loc, how = find_renew_button(page)
+                renew_loc, how = wait_for_renew_button(page, container, timeout_s=20)
             if renew_loc is None:
                 RESULT["failed_step"] = "没找到续期入口（页面无 Renew 按钮/链接）"
+                RESULT["note"] = "页面快照: " + page_snapshot_note(page, email)
                 log("失败阶段: 没找到续期入口（页面无 Renew 按钮/链接）")
+                log("失败时页面全文: " + RESULT["note"])
                 shot.take("fail-no-renew-button")
                 return 4
             log(f"找到续期入口: {how}")
